@@ -5,6 +5,7 @@ format: html
 
 This post introduces basic overviews and examples of the two most common multivariate statistical process monitoring [(MSPM)](https://trgrimm.github.io/posts/2024/03/mspm/) methods: the $T^2$ and MEWMA control charts.
 
+Code to produce this blog post can be found in [this](https://github.com/trgrimm/t2_mewma) GitHub repository.
 
 ```{r}
 #| echo: false
