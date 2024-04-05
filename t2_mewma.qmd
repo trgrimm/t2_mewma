@@ -1,0 +1,524 @@
+---
+title: "t2_mewma"
+format: html
+---
+
+This post introduces basic overviews and examples of the two most common multivariate statistical process monitoring [(MSPM)](https://trgrimm.github.io/posts/2024/03/mspm/) methods: the $T^2$ and MEWMA control charts.
+
+
+```{r}
+#| echo: false
+
+# Function to perform the T2 control chart
+# using classical or robust (RMCD) estimators of the mean and covariance
+# and parametric or nonparametric thresholds (control limits)
+hot_t2 <- function(train_data, test_data,
+                   method = 'classical', threshold = 'parametric', far = NULL, ic_arl = 200) {
+  if(method == 'classical') {
+    mean_vec <- colMeans(train_data)
+    cov_mat <- cov(train_data)
+  } else if(method == 'rmcd') {
+    ests <- robustbase::covMcd(train_data) # reweighted MCD by default
+    mean_vec <- ests$center
+    cov_mat <- ests$cov
+  } else {
+    stop(paste0("Invalid estimation method '", method, "'."))
+  }
+  p <- ncol(train_data)
+  num_train <- nrow(train_data)
+  
+  if(!is.null(ic_arl)) {
+    prob <- 1 - (1 / ic_arl)
+  } else {
+    prob <- 1 - far
+  }
+  
+  t2_train <- mahalanobis(train_data, center = mean_vec, cov = cov_mat)
+  
+  if(threshold == 'nonparametric') {
+    # use the t2_train values to compute a nonparametric threshold, if desired
+    # nonparametric threshold using the Silverman bandwidth
+    h <- BMS:::quantile.density(density(t2_train, bw = 'nrd0'), probs = prob) 
+  } else if(threshold == 'parametric') {
+    # parametric sampling distribution under independence and multivariate normality (for classical mean/cov estimators)
+    h <- ((p*(num_train^2 - 1)) / (num_train*(num_train - p))) * qf(prob, p, num_train - p)
+  } else {
+    stop(paste0("Invalid threshold '", threshold, "'."))
+  }
+  
+  # t2 values during the testing period
+  t2_val <- mahalanobis(test_data, center = mean_vec, cov = cov_mat) 
+  
+  list(train_t2 = t2_train, mon_stats = t2_val, exceedances = t2_val > h, threshold = h)
+}
+
+
+# Function to perform the MEWMA control chart
+# using classical or robust (RMCD) estimators of the mean and covariance
+mewma <- function(train_data, test_data, method = 'classical',
+                  lambda = 0.1, ic_arl = 200) {
+  
+  if(method == 'classical') {
+    mean_vec <- colMeans(train_data)
+    cov_mat <- cov(train_data)
+  } else if(method == 'rmcd') {
+    ests <- robustbase::covMcd(train_data)
+    mean_vec <- ests$center # reweighted MCD by default
+    cov_mat <- ests$cov
+  } else {
+    stop(paste0("Invalid estimation method '", method, "'."))
+  }
+  
+  # center the testing (phase 2) data using the parameter estimates from the training (phase 1) data
+  x <- scale(test_data, center = mean_vec, scale = F)
+  
+  p <- ncol(x)
+  q <- matrix(nrow = nrow(x), ncol = p)
+
+  for(i in 1:nrow(x)) {
+    if(i == 1) {
+      q[i, ] <- lambda * x[i, ] + (1 - lambda)*0 #q_0 is the true IC mean, usually the 0 vector (without loss of generality for simulation study)
+    } else {
+      q[i, ] <- lambda * x[i, ] + (1 - lambda)*q[i-1, ]
+    }
+    # sigma_q <- ((lambda / (2 - lambda)) * (1 - (1 - lambda)^(2*i))) * cov_mat # exact covariance
+  }
+  sigma_q <- (lambda / (2 - lambda)) * cov_mat # asymptotic variance, used in Lowry et al. (1992)
+ 
+  t2_val <- numeric()
+  for(i in 1:nrow(x)) {
+    t2_val[i] <- t(q[i, ]) %*% solve(sigma_q) %*% q[i, ]
+  }
+  
+  if(!is.null(ic_arl)) {
+    # use a control limit (h) that ensures IC ARL of ic_arl (such as 200)
+    h <- spc::mewma.crit(l = lambda, L0 = ic_arl, p = p) # this assumes multivariate normality
+  }
+  
+  list(mon_stats = t2_val, exceedances = t2_val > h, threshold = h)
+}
+
+```
+
+```{r}
+#| echo: false
+
+set.seed(24)
+
+# Generate train and test data for different types of faults
+# here, all data are independent multivariate normal draws
+train_data_indep <- MASS::mvrnorm(500, mu = c(0, 0, 0), Sigma = diag(3))
+
+# Sustained fault
+test_data_indep <- rbind(MASS::mvrnorm(50, mu = c(0, 0, 0), Sigma = diag(3)),
+                         MASS::mvrnorm(150, mu = c(2, 2, 2), Sigma = diag(3)))
+
+# Transient faults
+test_data_indep3 <- rbind(MASS::mvrnorm(50, mu = c(0, 0, 0), Sigma = diag(3)),
+                         MASS::mvrnorm(3, mu = c(2, 2, 2), Sigma = diag(3)),
+                         MASS::mvrnorm(20, mu = c(0, 0, 0), Sigma = diag(3)),
+                         MASS::mvrnorm(3, mu = c(2, 2, 2), Sigma = diag(3)),
+                         MASS::mvrnorm(54, mu = c(0, 0, 0), Sigma = diag(3)),
+                         MASS::mvrnorm(10, mu = c(2, 2, 2), Sigma = diag(3)),
+                         MASS::mvrnorm(60, mu = c(0, 0, 0), Sigma = diag(3)))
+
+# Isolated faults
+test_data_rand <- MASS::mvrnorm(200, mu = c(0, 0, 0), Sigma = diag(3))
+# Pick which 5 indices to replace with draws from a shifted distribution
+outlier_ind <- c(34, 66, 135, 138, 179)
+# Replace IC observations with outliers
+test_data_rand[outlier_ind, ] <- MASS::mvrnorm(5, mu = c(3, 3, 3), Sigma = diag(3))
+```
+
+
+
+---
+
+Both methods discussed below are *multivariate* statistical methods for fault detection. To understand the specifics of each method, we establish the following notation:
+
+* $\mathbf{x}_t = (x_{1t}, x_{2t}, \ldots, x_{pt})$ represents the values of $p$ different variables observed at time $t$
+* $t \in \{1, 2, \ldots, n\}$. That is, there are $n$ time points (observations) where the $p$ variables are observed
+* $\boldsymbol{\mu} = (\mu_1, \mu_2, \ldots, \mu_p)$ is the in-control (IC) mean vector
+* $\boldsymbol{\Sigma}$ is the IC covariance matrix
+* $\boldsymbol{\hat{\mu}}$ and $\boldsymbol{\widehat{\Sigma}}$ are estimates of the mean vector and covariance matrix, respectively
+
+---
+
+## Hotelling's $T^2$ Chart
+
+The $T^2$ control chart was developed by [Harold Hotelling](https://en.wikipedia.org/wiki/Harold_Hotelling)[^1] and was the first commonly used approach for multivariate statistical process monitoring (MSPM). The $T^2$ chart is simple, easy to use, and has been shown to perform well at detecting large shifts, but not at detecting small to moderate shifts or gradual drifts.[^2][^3]
+
+To monitor new data for abnormalities, we can construct the $T^2$ chart by computing
+$$
+T^2_t = (\mathbf{x}_t - \boldsymbol{\mu})' \boldsymbol{\Sigma}^{-1} (\mathbf{x}_t - \boldsymbol{\mu})
+$$
+and checking if 
+$$
+T^2_t > \chi^2_{1-\alpha, p},
+$$
+
+where $\chi^2_{1-\alpha, p}$ is the $1-\alpha$ quantile of the $\chi^2$ distribution with $p$ degrees of freedom.
+
+The problem with the chart described above is that it assumes the IC mean and covariance matrix, $\boldsymbol{\mu}$ and $\boldsymbol{\Sigma}$, are known. **This is almost never true**.
+
+For more realistic problems, we instead compute
+$$
+T^2_t = (\mathbf{x}_t - \boldsymbol{\hat{\mu}})' \boldsymbol{\widehat{\Sigma}}^{-1} (\mathbf{x}_t - \boldsymbol{\hat{\mu}})
+$$
+and check if
+$$
+T^2_t > \frac{p(n^2 - 1)}{n(n-p)}F_{1-\alpha, p, n-p}.
+$$
+
+Observations where the monitoring statistic $T^2$ exceed the upper threshold are flagged as out-of-control (OC), and we say that a fault occurred or is ongoing at that time.
+
+<!-- Note: -->
+<!-- : The $T^2$ statistic relies upon data only at time $t$ and therefore does not incorporate information from previous points in time. -->
+**Note:** The $T^2$ statistic relies upon data only at time $t$ and therefore does not incorporate information from previous points in time.
+
+
+### Assumptions
+
+The $T^2$ chart relies on two main assumptions:
+
+* independence
+* multivariate normality
+
+In many processes, data is collected at a high frequency over time, violating the assumption of independence. Additionally, many processes with computed or complex variables may violate the assumption of multivariate normality due to heavy-tailed or skewed data. 
+
+Mild violations of these assumptions can still yield adequate fault detection results with the $T^2$ chart, but more severe violations typically result in poor performance[^4].
+
+
+```{r}
+#| echo: false
+
+
+t2_fit <- hot_t2(train_data_indep, test_data_indep)
+t2_fit_3 <- hot_t2(train_data_indep, test_data_indep3)
+
+# Create a plot for T2 chart on sustained fault data
+plot_1_t2 <- function(t2) {
+par(mar = c(2, 4, 3, 1))
+plot(t2$mon_stats, type = 'l', ylim = c(0, 45),
+     xlab = '', ylab = expression(italic(T)^2), main = expression(italic(T)^2~"Control Chart"),
+     xaxt = 'n')
+abline(v = 50, col = 'goldenrod', lty = 3)
+abline(h = t2$threshold, col = 'firebrick', lty = 2)
+points(50, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 50, lwd = 2, col = 'goldenrod', labels = 'Shift', col.axis = 'goldenrod')
+legend('topleft', legend = "Threshold", lty = 2,
+       col = "firebrick", bty = 'n')
+axis(1, at = c(0, 100, 150, 200), lwd = 1, col = 'black',
+       labels = c('0', '100', '150', '200'))
+par(mar = c(5, 4, 4, 2) + 0.1)
+}
+
+# Create a plot for T2 chart on transient fault data
+plot_3_t2 <- function(t2) {
+  par(mar = c(2, 4, 3, 1))
+  plot(t2$mon_stats, type = 'l', ylim = c(0, 45),
+       xlab = '', ylab = expression(italic(T)^2), main = expression(italic(T)^2~"Control Chart"),
+       xaxt = 'n')
+  abline(v = c(50, 73, 130), col = 'goldenrod', lty = 3)
+  abline(h = t2$threshold, col = 'firebrick', lty = 2)
+  points(c(50, 73, 130), rep(-1.25, 3), col = 'goldenrod', pch = 17)
+  axis(1, at = 50, lwd = 2, col = 'goldenrod', labels = "Shift", col.axis = 'goldenrod')
+  axis(1, at = 73, lwd = 2, col = 'goldenrod', labels = "Shift", col.axis = 'goldenrod')
+  axis(1, at = 130, lwd = 2, col = 'goldenrod', labels = "Shift", col.axis = 'goldenrod')
+  axis(1, at = c(0, 100, 150, 200), lwd = 1, col = 'black',
+       labels = c('0', '100', '150', '200'))
+  legend('topleft', legend = c("Threshold"), lty = 2,
+         col = c("firebrick"), bty = 'n')
+par(mar = c(5, 4, 4, 2) + 0.1)
+}
+```
+
+---
+
+## Multivariate Exponentially Weighted Moving Average (MEWMA) Chart
+
+The MEWMA chart[^5] is a popular approach to monitoring multivariate data that excels at detecting small to moderate shifts.
+
+In practice, the MEWMA is constructed by first computing
+$$
+\mathbf{q}_t = \lambda(\mathbf{x}_t - \boldsymbol{\hat\mu}) + (1-\lambda)\mathbf{q}_{t-1},
+$$
+where
+
+* $\lambda$ is a smoothing parameter, often selected to be between 0.05 and 0.2
+  * smaller values of $\lambda$ are better for detecting smaller shifts
+* $\mathbf{q}_0$ is set to 0.
+
+Then, the chart classifies observations as OC when
+$$
+p_{\text{MEWMA}} = \mathbf{q}_t' \boldsymbol{\widehat{\Sigma}}^{-1}_{\mathbf{q}_t} \mathbf{q}_t > h,
+$$
+
+where
+
+* $h$ is a threshold selected to ensure a desired IC average run length (ARL), which is the expected number of observations before the chart is expected to falsely classify an observation as OC when the process is IC
+* $\boldsymbol{\widehat{\Sigma}}_{\mathbf{q}_t} = [\lambda(1 - (1-\lambda))^{2t}]\boldsymbol{\widehat{\Sigma}}$, which converges to $(\lambda/(2-\lambda))\boldsymbol{\widehat{\Sigma}}$ asymptotically.
+
+Notice that if we select $\lambda = 1$, the MEWMA chart is equivalent to the $T^2$ chart.
+
+**Note:** The MEWMA monitoring statistic relies on the data both at time $t$ and at previous time points, allowing this method to better detect small accumulations over time than the $T^2$ chart.
+
+
+### Assumptions
+
+The assumptions of the MEWMA chart are similar to the $T^2$ chart:
+
+* independence
+* multivariate normality
+
+The MEWMA chart is fairly robust to violations of independence and can even perform well under moderate deviations from multivariate normality if $\lambda$ is sufficiently small[^6].
+
+```{r}
+#| echo: false
+mewma_fit <- mewma(train_data_indep, test_data_indep, lambda = 0.1)
+mewma_fit_3 <- mewma(train_data_indep, test_data_indep3, lambda = 0.1)
+
+# Create a plot for MEWMA chart on sustained fault data
+plot_1_mewma <- function(mewma_fit) {
+par(mar = c(2, 4, 3, 1))
+  plot(1:200, mewma_fit$mon_stats, type = 'l',
+       xlab = '', ylab = expression(italic(p)[MEWMA]),main = expression("MEWMA Control Chart"),
+       xaxt = 'n')
+  abline(v = 50, col = 'goldenrod', lty = 3)
+  abline(h = mewma_fit$threshold, col = 'firebrick', lty = 2)
+  points(50, -8, col = 'goldenrod', pch = 17)
+  axis(1, at = c(50),
+       lwd = 2,
+       col = 'goldenrod',
+       labels = "Shift",
+       col.axis = 'goldenrod')
+  axis(1, at = c(0, 100, 150, 200), lwd = 1, col = 'black',
+       labels = c('0', '100', '150', '200'))
+  legend('topleft', legend = c("Threshold"), lty = 2,
+         col = c("firebrick"), bty = 'n')
+par(mar = c(5, 4, 4, 2) + 0.1)
+}
+
+# Create a plot for MEWMA chart on transient fault data
+plot_3_mewma <- function(mewma_fit) {
+par(mar = c(2, 4, 3, 1))
+  plot(1:200, mewma_fit$mon_stats, type = 'l',
+       xlab = '', ylab = expression(italic(p)[MEWMA]), main = expression("MEWMA Control Chart"),
+       xaxt = 'n')
+  abline(v = c(50, 73, 130), col = 'goldenrod', lty = 3)
+  abline(h = mewma_fit$threshold, col = 'firebrick', lty = 2)
+  points(c(50, 73, 130), rep(-2.25, 3), col = 'goldenrod', pch = 17)
+  axis(1, at = 50, lwd = 2, col = 'goldenrod', labels = "Shift", col.axis = 'goldenrod')
+  axis(1, at = 73, lwd = 2, col = 'goldenrod', labels = "Shift", col.axis = 'goldenrod')
+  axis(1, at = 130, lwd = 2, col = 'goldenrod', labels = "Shift", col.axis = 'goldenrod')
+  axis(1, at = c(0, 100, 150, 200), lwd = 1, col = 'black',
+       labels = c('0', '100', '150', '200'))
+  legend('topleft', legend = c("Threshold"), lty = 2,
+         col = c("firebrick"), bty = 'n')
+par(mar = c(5, 4, 4, 2) + 0.1)
+}
+```
+
+
+---
+
+## Examples: Detecting Shifts in Means
+
+Examples below demonstrate the performance of each chart when detecting three types of faults (shifts) in mean vectors during Phase II:
+
+* isolated faults
+* sustained faults
+* transient faults
+
+**Isolated faults** are when the means shift at isolated points in time (random outliers)
+
+**Sustained faults** are when the means shift at some point in time and then remain shifted afterward.
+
+**Transient faults** are brief periods of time where the means have shifted but return to the IC mean after a few observations.
+
+For each example below, we first generate 500 Phase I observations from a 3-dimensional multivariate standard normal distribution. These observations are used to estimate the IC mean vector and covariance matrix.
+
+Then, the $T^2$ chart and the MEWMA chart (with $\lambda = 0.1$) are both used to monitor 200 new observations during Phase II.
+
+### Example: Detecting Isolated Faults
+
+To monitor isolated faults, we generate the following Phase II data:
+
+* $\mathbf{x}_t \sim \text{N}_3(\mathbf{0}, \mathbf{I}), \quad t \in \{1, 2, \ldots, 200\}$
+
+Then, we randomly replace 5 of the 200 points with draws from a shifted distribution.
+
+Here, the randomly selected points are $t = 34, 66, 135, 138,$ and $179$. So, we have the following draws for our isolated faults (outliers):
+
+* $\mathbf{x}_t \sim \text{N}_3(\mathbf{3}, \mathbf{I}), \quad t \in \{36, 66, 135, 138, 179\}$
+
+We want to see if the $T^2$ and MEWMA charts can detect these random isolated outliers among the rest of the observations, all of which are IC.
+
+The $T^2$ and MEWMA charts for this data are given in the figure below. Notice the following:
+
+* all outliers are immediately detected by the $T^2$ chart and are flagged as OC
+* not all outliers are detected by the MEWMA chart
+  * the outlier at osbervation 138 was detected because another outlier recently occurred at 135
+
+Recall that the $T^2$ monitoring statistic relies solely on the values of the data at time $t$, while the MEWMA chart relies on data at time $t$ and previous time points. As a result:
+
+* isolated faults will often go undetected unless $\lambda$ is selected to be large 
+  * (small values of $\lambda$ give less weight to the outlier when computing the monitoring statistic)
+
+
+```{r}
+#| echo: false
+#| fig-align: center
+#| fig-width: 7
+#| fig-height: 5
+
+# Code to create T2 and MEWMA plots for isolated faults
+
+#######
+# T2
+par(mfrow = c(2, 1))
+t2 <- hot_t2(train_data_indep, test_data_rand)
+par(mar = c(2, 4, 3, 1))
+plot(t2$mon_stats, type = 'l', ylim = c(0, 45),
+     xlab = '', ylab = expression(italic(T)^2), main = expression(italic(T)^2~"Control Chart"),
+     xaxt = 'n')
+abline(h = t2$threshold, col = 'firebrick', lty = 2)
+abline(v = 34, col = 'goldenrod', lty = 3)
+points(34, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 34, lwd = 2, col = 'goldenrod', labels = 'Outlier', col.axis = 'goldenrod')
+abline(v = 66, col = 'goldenrod', lty = 3)
+points(66, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 66, lwd = 2, col = 'goldenrod', labels = 'Outlier', col.axis = 'goldenrod')
+abline(v = 135, col = 'goldenrod', lty = 3)
+points(135, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 135, lwd = 2, col = 'goldenrod', labels = '', col.axis = 'goldenrod')
+abline(v = 138, col = 'goldenrod', lty = 3)
+points(138, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 138, lwd = 2, col = 'goldenrod', labels = '', col.axis = 'goldenrod')
+axis(1, at = 135.5, lwd = 0, col = 'goldenrod', labels = 'Outliers', col.axis = 'goldenrod')
+abline(v = 179, col = 'goldenrod', lty = 3)
+points(179, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 179, lwd = 2, col = 'goldenrod', labels = 'Outlier', col.axis = 'goldenrod')
+legend('topleft', legend = "Threshold", lty = 2,
+       col = "firebrick", bty = 'n')
+axis(1, at = c(0, 100, 150, 200), lwd = 1, col = 'black',
+       labels = c('0', '100', '150', '200'))
+par(mar = c(5, 4, 4, 2) + 0.1)
+
+#######
+# MEWMA
+mewma_isolated <- mewma(train_data_indep, test_data_rand)
+par(mar = c(2, 4, 3, 1))
+plot(mewma_isolated$mon_stats, type = 'l', ylim = c(0, 45),
+     xlab = '', ylab = expression(italic(p)[MEWMA]), main = expression("MEWMA Control Chart"),
+     xaxt = 'n')
+abline(h = mewma_isolated$threshold, col = 'firebrick', lty = 2)
+abline(v = 34, col = 'goldenrod', lty = 3)
+points(34, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 34, lwd = 2, col = 'goldenrod', labels = 'Outlier', col.axis = 'goldenrod')
+abline(v = 66, col = 'goldenrod', lty = 3)
+points(66, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 66, lwd = 2, col = 'goldenrod', labels = 'Outlier', col.axis = 'goldenrod')
+abline(v = 135, col = 'goldenrod', lty = 3)
+points(135, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 135, lwd = 2, col = 'goldenrod', labels = '', col.axis = 'goldenrod')
+abline(v = 138, col = 'goldenrod', lty = 3)
+points(138, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 138, lwd = 2, col = 'goldenrod', labels = '', col.axis = 'goldenrod')
+axis(1, at = 135.5, lwd = 0, col = 'goldenrod', labels = 'Outliers', col.axis = 'goldenrod')
+abline(v = 179, col = 'goldenrod', lty = 3)
+points(179, -1.25, col = 'goldenrod', pch = 17)
+axis(1, at = 179, lwd = 2, col = 'goldenrod', labels = 'Outlier', col.axis = 'goldenrod')
+legend('topleft', legend = "Threshold", lty = 2,
+       col = "firebrick", bty = 'n')
+axis(1, at = c(0, 100, 150, 200), lwd = 1, col = 'black',
+       labels = c('0', '100', '150', '200'))
+par(mar = c(5, 4, 4, 2) + 0.1)
+par(mfrow = c(1, 1))
+```
+
+### Example: Detecting a Sustained Fault
+
+To introduce a sustained fault, we generate the following data:
+
+* $\mathbf{x}_t \sim \text{N}_3(\mathbf{0}, \mathbf{I}), \quad t \in \{1, 2, \ldots, 50\}$
+* $\mathbf{x}_t \sim \text{N}_3(\mathbf{2}, \mathbf{I}), \quad t \in \{51, 52, \ldots, 200\}$
+
+So, we are trying to detect the change in the means from 0 to 2, where all means have shifted the same magnitude in the same direction.
+
+The $T^2$ and MEWMA charts for this data are given in the figure below. Notice that the monitoring statistics for both methods quickly jump above the threshold once the shift occurs at observation index 50.
+
+```{r fig1}
+#| echo: false
+#| fig-align: center
+#| fig-width: 7
+#| fig-height: 5
+
+# Plots of sustained faults
+par(mfrow=c(2, 1))
+plot_1_t2(t2_fit)
+plot_1_mewma(mewma_fit)
+par(mfrow=c(1, 1))
+```
+
+We see that
+
+* both charts detect the shift almost instantly
+* the $T^2$ chart does not consistently remain above the threshold after the shift
+  * observations with $T^2$ values below the threshold are not flagged even though the mean vector has shifted
+* the MEWMA chart remains above the threshold after the shift
+  * all observations after the shift are flagged as OC
+  
+In summary, both the $T^2$ and MEWMA charts are able to immediately detect the shift in the mean vector. Furthermore, the $T^2$ chart does not classify all observations after the shift as OC, but the MEWMA chart does.
+
+
+
+### Example: Detecting Transient Faults
+
+To introduce transient faults, we generate the following data:
+
+* $\mathbf{x}_t \sim \text{N}_3(\mathbf{0}, \mathbf{I}), \quad t \in \{1, 2, \ldots, 50, 53, 54, 55, \ldots, 73, 77, 78, 79, \ldots, 130, 141, 142, 143, \ldots, 200\}$
+* $\mathbf{x}_t \sim \text{N}_3(\mathbf{2}, \mathbf{I}), \quad t \in \{51, 52, 53, 74, 75, 76, 131, 132, 133, \ldots, 140\}$
+
+In other words, there is a shift in the mean vector from $(0, 0, 0)'$ to $(2, 2, 2)'$ starting at $t = 51$ and $t = 73$ that lasts for 3 observations and a shift at $t = 131$ that lasts 10 observations. All other observations are drawn from the IC distribution.
+
+Plots of the $T^2$ and MEWMA charts for the data described above are shown below.
+```{r}
+#| echo: false
+#| fig-align: center
+#| fig-width: 7
+#| fig-height: 5
+
+# Plots of transient faults
+par(mfrow=c(2, 1))
+plot_3_t2(t2_fit_3)
+plot_3_mewma(mewma_fit_3)
+par(mfrow=c(1, 1))
+```
+
+We see that
+
+* the $T^2$ chart detects the transient faults immediately, but the fault at $t = 131$ is not fully flagged as OC
+* the MEWMA chart detects the first and third transient faults, but not the shift at $t = 73$
+  * the chart flags all observations as OC during the shift at $t = 131$
+  
+  
+## Conclusion
+
+In summary, both the $T^2$ and MEWMA charts are great tools for detecting faults in multivariate processes. The $T^2$ chart performs better at quickly detecting large or isolated faults, while the MEWMA chart performs better at detecting small to moderate faults over time. 
+
+Both the $T^2$ and MEWMA charts assume independence and multivariate normality. In the examples above, observations were generated according to these assumptions. However, if either of these assumptions is violated, adjustments are required to achieve desirable fault detection performance. 
+
+Some examples of adjustments include:
+
+* (dependence in the data): fitting the $T^2$ and MEWMA charts to detrended values from a regression, machine learning, or time series model fit
+* (non-normality): using a nonparametric control chart or a nonparametric estimate for the threshold (control limit).
+
+---
+
+[^1]: Hotelling, H. (1947). Multivariate quality control. In Eisenhart, C., Hastay, M. W., and Wallis, W., editors, *Techniques of Statistical Analysis*, pages 111–184. McGraw-Hill, New York
+[^2]: Sullivan, J. H. and Woodall, W. H. (1996). A comparison of multivariate control charts for individual observations. *Journal of Quality Technology*, 28(4):398–408.
+[^3]: Bersimis, S., Psarakis, S., and Panaretos, J. (2007). Multivariate statistical process control charts: An overview. *Quality and Reliability Engineering International*, 23(5):517–543.
+[^4]: Alfaro, J.-L. and Ortega, J.-F. (2012). Robust Hotelling’s $T^2$ control charts under non-normality: The case of $t$-Student distribution. *Journal of Statistical Computation and Simulation*, 82(10):1437–1447
+[^5]: Lowry, C. A., Woodall, W. H., Champ, C. W., and Rigdon, S. E. (1992). A multivariate exponentially weighted moving average control chart. *Technometrics*, 34(1):46
+[^6]: Stoumbos, Z. G. and Sullivan, J. H. (2002). Robustness to non-normality of the multivariate EWMA control chart. *Journal of Quality Technology*, 34(3):260–276
